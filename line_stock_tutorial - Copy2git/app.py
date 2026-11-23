@@ -1,167 +1,192 @@
 # -*- coding: utf-8 -*-
+"""台股 LINE Bot（修改版）
 
+指令：
+  me        -> 顯示你的 LINE user id
+  profile   -> 顯示你的 LINE 個人資料
+  #2330     -> 即時股價 + 最近五個交易日收盤價
+  /2330     -> 收盤價走勢圖
 
-from __future__ import unicode_literals
-
-import random
+需要的環境變數：
+  LINE_CHANNEL_SECRET
+  LINE_CHANNEL_ACCESS_TOKEN
+  BASE_URL   (ngrok 的 https 網址，例如 https://xxxx.ngrok-free.dev，結尾不要加 /)
+"""
+import os
+import re
 import time
-from datetime import timedelta, datetime
-from pymongo import MongoClient
-
-#ref: http://twstock.readthedocs.io/zh_TW/latest/quickstart.html#id2
-import twstock
+from datetime import datetime
 
 import matplotlib
-matplotlib.use('Agg') # ref: https://matplotlib.org/faq/howto_faq.html
+matplotlib.use('Agg')  # 不開視窗，只存檔
 import matplotlib.pyplot as plt
 import pandas as pd
-
-from imgurpython import ImgurClient
+import twstock
 
 from flask import Flask, request, abort
-from linebot import (
-    LineBotApi, WebhookParser
+from linebot import LineBotApi, WebhookParser
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import (
+    MessageEvent, TextMessage, TextSendMessage, ImageSendMessage
 )
-from linebot.exceptions import (
-    InvalidSignatureError
-)
-from linebot.models import *
 
 app = Flask(__name__)
 
+# ---------- 設定（從環境變數讀取，不要把金鑰寫死在程式裡）----------
+CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
+CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
+BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
 
-channel_secret_8 = 'your channel_secret'
-channel_access_token_8 = 'your channel_access_token'
-line_bot_api_8 = LineBotApi(channel_access_token_8)
-parser_8 = WebhookParser(channel_secret_8)
+line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
+parser = WebhookParser(CHANNEL_SECRET)
+
+# 圖表存在 static 資料夾，Flask 會自動在 /static/檔名 提供下載
+STATIC_DIR = os.path.join(app.root_path, "static")
+os.makedirs(STATIC_DIR, exist_ok=True)
+
+# 股票代號只允許 4~6 碼英數字，避免使用者輸入奇怪字元（尤其是拿來當檔名）
+STOCK_ID_PATTERN = re.compile(r"^[0-9A-Za-z]{4,6}$")
+
+HELP_TEXT = (
+    "可用指令：\n"
+    "#2330  即時股價與近五日收盤價\n"
+    "/2330  收盤價走勢圖\n"
+    "me  顯示你的 user id\n"
+    "profile  顯示你的個人資料"
+)
 
 
-#===================================================
-#   stock bot
-#===================================================
-@app.route("/callback_yangbot8", methods=['POST'])
-def callback_yangbot8():
-    signature = request.headers['X-Line-Signature']
+# ---------- 功能函式 ----------
+def build_realtime_text(stock_id):
+    """即時股價 + 最近五個交易日收盤價，回傳文字。"""
+    rt = twstock.realtime.get(stock_id)
+    if not rt.get("success"):
+        return "查不到 %s 的即時資料：%s" % (stock_id, rt.get("rtmessage", "未知錯誤"))
 
-    # get request body as text
+    # timestamp 是 UTC 秒數；本機是台灣時區，直接轉換即可（不需再加 8 小時）
+    time_str = datetime.fromtimestamp(rt["timestamp"]).strftime("%H:%M:%S")
+    info = rt["info"]
+    r = rt["realtime"]
+
+    lines = [
+        "%s (%s) %s" % (info["name"], info["code"], time_str),
+        "現價: %s / 開盤: %s" % (r["latest_trade_price"], r["open"]),
+        "最高: %s / 最低: %s" % (r["high"], r["low"]),
+        "成交量: %s" % r["accumulate_trade_volume"],
+        "-----",
+        "最近五個交易日收盤價:",
+    ]
+
+    stock = twstock.Stock(stock_id)
+    prices = stock.price[-5:][::-1]
+    dates = stock.date[-5:][::-1]
+    for d, p in zip(dates, prices):
+        lines.append("[%s] %s" % (d.strftime("%Y-%m-%d"), p))
+    return "\n".join(lines)
+
+
+def build_chart(stock_id):
+    """畫收盤價走勢圖，存到 static，回傳檔名。"""
+    stock = twstock.Stock(stock_id)
+    df = pd.DataFrame({"date": stock.date, "close": stock.close})
+
+    filename = "%s_%d.png" % (stock_id, int(time.time()))
+    path = os.path.join(STATIC_DIR, filename)
+
+    df.plot(x="date", y="close")
+    plt.title("[%s]" % stock.sid)
+    plt.savefig(path)
+    plt.close()
+    return filename
+
+
+# ---------- Webhook ----------
+@app.route("/callback", methods=["POST"])
+def callback():
+    signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
     app.logger.info("Request body: " + body)
 
-    # parse webhook body
     try:
-        events = parser_8.parse(body, signature)
+        events = parser.parse(body, signature)
     except InvalidSignatureError:
         abort(400)
 
-    # if event is MessageEvent and message is TextMessage, then echo text
     for event in events:
         if not isinstance(event, MessageEvent):
             continue
         if not isinstance(event.message, TextMessage):
             continue
 
-        text=event.message.text
-        #userId = event['source']['userId']
-        if(text.lower()=='me'):
-            content = str(event.source.user_id)
-
-            line_bot_api_8.reply_message(
+        text = event.message.text.strip()
+        try:
+            handle_text(event, text)
+        except Exception:
+            app.logger.exception("處理訊息時發生錯誤")
+            line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text=content)
-            )
-        elif(text.lower() == 'profile'):
-            profile = line_bot_api_8.get_profile(event.source.user_id)
-            my_status_message = profile.status_message
-            if not my_status_message:
-                my_status_message = '-'
-            line_bot_api_8.reply_message(
-                event.reply_token, [
-                    TextSendMessage(
-                        text='Display name: ' + profile.display_name
-                    ),
-                    TextSendMessage(
-                        text='picture url: ' + profile.picture_url
-                    ),
-                    TextSendMessage(
-                        text='status_message: ' + my_status_message
-                    ),
-                ]
+                TextSendMessage(text="查詢失敗，請稍後再試或確認股票代號。"),
             )
 
-        elif(text.startswith('#')):
-            text = text[1:]
-            content = ''
+    return "OK"
 
-            stock_rt = twstock.realtime.get(text)
-            my_datetime = datetime.fromtimestamp(stock_rt['timestamp']+8*60*60)
-            my_time = my_datetime.strftime('%H:%M:%S')
 
-            content += '%s (%s) %s\n' %(
-                stock_rt['info']['name'],
-                stock_rt['info']['code'],
-                my_time)
-            content += '現價: %s / 開盤: %s\n'%(
-                stock_rt['realtime']['latest_trade_price'],
-                stock_rt['realtime']['open'])
-            content += '最高: %s / 最低: %s\n' %(
-                stock_rt['realtime']['high'],
-                stock_rt['realtime']['low'])
-            content += '量: %s\n' %(stock_rt['realtime']['accumulate_trade_volume'])
+def handle_text(event, text):
+    if text.lower() == "me":
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=str(event.source.user_id)),
+        )
 
-            stock = twstock.Stock(text)#twstock.Stock('2330')
-            content += '-----\n'
-            content += '最近五日價格: \n'
-            price5 = stock.price[-5:][::-1]
-            date5 = stock.date[-5:][::-1]
-            for i in range(len(price5)):
-                #content += '[%s] %s\n' %(date5[i].strftime("%Y-%m-%d %H:%M:%S"), price5[i])
-                content += '[%s] %s\n' %(date5[i].strftime("%Y-%m-%d"), price5[i])
-            line_bot_api_8.reply_message(
+    elif text.lower() == "profile":
+        profile = line_bot_api.get_profile(event.source.user_id)
+        line_bot_api.reply_message(
+            event.reply_token,
+            [
+                TextSendMessage(text="Display name: " + profile.display_name),
+                TextSendMessage(text="picture url: " + (profile.picture_url or "-")),
+                TextSendMessage(text="status_message: " + (profile.status_message or "-")),
+            ],
+        )
+
+    elif text.startswith("#") or text.startswith("/"):
+        command, stock_id = text[0], text[1:].strip()
+        if not STOCK_ID_PATTERN.match(stock_id):
+            line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text=content)
+                TextSendMessage(text="股票代號格式不正確，例如：#2330"),
             )
+            return
 
-        elif(text.startswith('/')):
-            text = text[1:]
-            fn = '%s.png' %(text)
-            stock = twstock.Stock(text)
-            my_data = {'close':stock.close, 'date':stock.date, 'open':stock.open}
-            df1 = pd.DataFrame.from_dict(my_data)
-
-            df1.plot(x='date', y='close')
-            plt.title('[%s]' %(stock.sid))
-            plt.savefig(fn)
-            plt.close()
-
-            # -- upload
-            # imgur with account: your.mail@gmail.com
-            client_id = 'your imgur client_id'
-            client_secret = 'your imgur client_secret'
-
-            client = ImgurClient(client_id, client_secret)
-            print("Uploading image... ")
-            image = client.upload_from_path(fn, anon=True)
-            print("Done")
-
-            url = image['link']
-            image_message = ImageSendMessage(
-                original_content_url=url,
-                preview_image_url=url
+        if command == "#":
+            content = build_realtime_text(stock_id)
+            line_bot_api.reply_message(
+                event.reply_token, TextSendMessage(text=content)
             )
-
-            line_bot_api_8.reply_message(
-                event.reply_token,
-                image_message
+        else:
+            if not BASE_URL:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text="尚未設定 BASE_URL，無法回傳圖片。"),
                 )
+                return
+            filename = build_chart(stock_id)
+            url = "%s/static/%s" % (BASE_URL, filename)
+            line_bot_api.reply_message(
+                event.reply_token,
+                ImageSendMessage(original_content_url=url, preview_image_url=url),
+            )
+
+    else:
+        line_bot_api.reply_message(
+            event.reply_token, TextSendMessage(text=HELP_TEXT)
+        )
 
 
-    return 'OK'
-
-
-@app.route("/", methods=['GET'])
+@app.route("/", methods=["GET"])
 def basic_url():
-    return 'OK'
+    return "OK"
 
 
 if __name__ == "__main__":
-    app.run()
+    app.run(port=5000)
